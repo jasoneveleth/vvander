@@ -11,12 +11,21 @@ const STORAGE_RES = 10; // Store at res 10 (~50m hexes)
 
 const db = SQLite.openDatabaseSync('vvander.db');
 db.execSync('CREATE TABLE IF NOT EXISTS visited (h3 TEXT PRIMARY KEY)');
+db.execSync(`CREATE TABLE IF NOT EXISTS locations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp INTEGER NOT NULL,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL
+)`);
 
 const getVisited = (): string[] =>
   db.getAllSync<{ h3: string }>('SELECT h3 FROM visited').map((r) => r.h3);
 
 const addVisited = (h3: string) =>
   db.runSync('INSERT OR IGNORE INTO visited (h3) VALUES (?)', [h3]);
+
+const addLocation = (timestamp: number, latitude: number, longitude: number) =>
+  db.runSync('INSERT INTO locations (timestamp, latitude, longitude) VALUES (?, ?, ?)', [timestamp, latitude, longitude]);
 
 // Background task - runs in separate JS context
 TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
@@ -25,6 +34,7 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
   for (const loc of locations) {
     const h3 = geoToH3(loc.coords.latitude, loc.coords.longitude, STORAGE_RES);
     addVisited(h3);
+    addLocation(loc.timestamp, loc.coords.latitude, loc.coords.longitude);
   }
 });
 
@@ -81,7 +91,8 @@ export default function App() {
   const [tracking, setTracking] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<string>('');
 
-  // Throttle region updates
+  // Refs
+  const mapRef = useRef<MapView>(null);
   const lastUpdateRef = useRef<number>(0);
   const pendingRegionRef = useRef<Region | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -191,6 +202,17 @@ export default function App() {
     }));
   }, [region, visited]);
 
+  const centerOnLocation = async () => {
+    const current = await Location.getCurrentPositionAsync({});
+    const { latitude, longitude } = current.coords;
+    mapRef.current?.animateToRegion({
+      latitude,
+      longitude,
+      latitudeDelta: 0.01,
+      longitudeDelta: 0.01,
+    }, 300);
+  };
+
   if (!loc) {
     return (
       <View style={styles.center}>
@@ -205,6 +227,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <MapView
+        ref={mapRef}
         style={styles.container}
         initialRegion={{ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }}
         onRegionChange={updateRegion}
@@ -221,6 +244,9 @@ export default function App() {
           />
         ))}
       </MapView>
+      <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
+        <Text style={styles.locationIcon}>▲</Text>
+      </TouchableOpacity>
       <View style={styles.controls}>
         <Text style={styles.stats}>{visited.length} hexes explored</Text>
         <TouchableOpacity
@@ -253,6 +279,26 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   stopButton: { backgroundColor: '#d94a4a' },
+  locationButton: {
+    position: 'absolute',
+    top: 60,
+    right: 20,
+    backgroundColor: 'white',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+  },
+  locationIcon: {
+    fontSize: 20,
+    color: '#4a90d9',
+    transform: [{ rotate: '30deg' }],
+  },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   stats: { color: '#fff', fontSize: 14, backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, borderRadius: 4 },
   error: { color: '#ff6b6b', marginTop: 16, textAlign: 'center', paddingHorizontal: 20 },
