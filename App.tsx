@@ -183,7 +183,7 @@ export default function App() {
 
     // Don't render fog when zoomed out too far (performance + antimeridian issues)
     if (region.latitudeDelta > 20) {
-      return { fogPolygons: [], fogStatus: 'Fog hidden: zoom in to see' };
+      return { fogPolygons: [], fogStatus: 'Tiles hidden: please zoom in' };
     }
 
     const displayRes = getDisplayRes(region.latitudeDelta);
@@ -191,7 +191,7 @@ export default function App() {
 
     // Cap hex count to prevent performance issues
     if (viewportHexes.length > 2000) {
-      return { fogPolygons: [], fogStatus: `Fog hidden: too many hexes (${viewportHexes.length})` };
+      return { fogPolygons: [], fogStatus: `Tiles hidden: too many hexes (${viewportHexes.length})` };
     }
 
     const visitedSet = getVisitedAtRes(visited, displayRes);
@@ -247,6 +247,9 @@ export default function App() {
         initialRegion={{ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }}
         onRegionChange={updateRegion}
         showsUserLocation
+        pitchEnabled={true}
+        rotateEnabled={true}
+        mapType={region && region.latitudeDelta > 5 ? 'hybridFlyover' : 'standard'}
       >
         {fogPolygons.map(({ key, coordinates, holes }) => (
           <Polygon
