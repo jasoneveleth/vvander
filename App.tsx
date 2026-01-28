@@ -178,11 +178,22 @@ export default function App() {
   };
 
   // Calculate fog polygons for current viewport (merged boundaries only)
-  const fogPolygons = useMemo(() => {
-    if (!region) return [];
+  const { fogPolygons, fogStatus } = useMemo(() => {
+    if (!region) return { fogPolygons: [], fogStatus: null };
+
+    // Don't render fog when zoomed out too far (performance + antimeridian issues)
+    if (region.latitudeDelta > 20) {
+      return { fogPolygons: [], fogStatus: 'Fog hidden: zoom in to see' };
+    }
 
     const displayRes = getDisplayRes(region.latitudeDelta);
     const viewportHexes = getHexesInRegion(region, displayRes);
+
+    // Cap hex count to prevent performance issues
+    if (viewportHexes.length > 2000) {
+      return { fogPolygons: [], fogStatus: `Fog hidden: too many hexes (${viewportHexes.length})` };
+    }
+
     const visitedSet = getVisitedAtRes(visited, displayRes);
 
     // Filter to only unvisited hexes (the fog)
@@ -193,17 +204,21 @@ export default function App() {
 
     // Convert to react-native-maps format
     // multiPolygon is number[][][][] - array of polygons, each with loops, each with [lat,lng] points
-    return multiPolygon.map((polygon, i) => ({
+    const polygons = multiPolygon.map((polygon, i) => ({
       key: `fog-${i}-${displayRes}`,
       coordinates: polygon[0].map(([lat, lng]) => ({ latitude: lat, longitude: lng })),
       holes: polygon.slice(1).map((hole) =>
         hole.map(([lat, lng]) => ({ latitude: lat, longitude: lng }))
       ),
     }));
+
+    return { fogPolygons: polygons, fogStatus: null };
   }, [region, visited]);
 
   const centerOnLocation = async () => {
-    const current = await Location.getCurrentPositionAsync({});
+    const current = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.Low, // Fast response, good enough for centering
+    });
     const { latitude, longitude } = current.coords;
     mapRef.current?.animateToRegion({
       latitude,
@@ -247,6 +262,11 @@ export default function App() {
       <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
         <Text style={styles.locationIcon}>▲</Text>
       </TouchableOpacity>
+      {fogStatus && (
+        <View style={styles.fogStatusBanner}>
+          <Text style={styles.fogStatusText}>{fogStatus}</Text>
+        </View>
+      )}
       <View style={styles.controls}>
         <Text style={styles.stats}>{visited.length} hexes explored</Text>
         <TouchableOpacity
@@ -298,6 +318,21 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: '#4a90d9',
     transform: [{ rotate: '30deg' }],
+  },
+  fogStatusBanner: {
+    position: 'absolute',
+    top: 60,
+    left: 20,
+    right: 80,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  fogStatusText: {
+    color: '#fff',
+    fontSize: 13,
+    textAlign: 'center',
   },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   stats: { color: '#fff', fontSize: 14, backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, borderRadius: 4 },
