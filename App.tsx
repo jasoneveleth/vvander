@@ -4,7 +4,7 @@ import MapView, { Polygon } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import * as SQLite from 'expo-sqlite';
-import { latLngToCell, cellToBoundary } from 'h3-js';
+import { geoToH3, h3ToGeoBoundary } from '@six33/h3-reactnative';
 
 const TASK_NAME = 'VVANDER_LOCATION';
 const H3_RES = 9;
@@ -23,7 +23,7 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
   if (error || !data) return;
   const { locations } = data as { locations: Location.LocationObject[] };
   for (const loc of locations) {
-    const h3 = latLngToCell(loc.coords.latitude, loc.coords.longitude, H3_RES);
+    const h3 = geoToH3(loc.coords.latitude, loc.coords.longitude, H3_RES);
     addVisited(h3);
   }
 });
@@ -72,7 +72,7 @@ export default function App() {
     // Get initial location
     const initial = await Location.getCurrentPositionAsync({});
     setLoc({ latitude: initial.coords.latitude, longitude: initial.coords.longitude });
-    const h3 = latLngToCell(initial.coords.latitude, initial.coords.longitude, H3_RES);
+    const h3 = geoToH3(initial.coords.latitude, initial.coords.longitude, H3_RES);
     addVisited(h3);
     refreshVisited();
 
@@ -97,7 +97,7 @@ export default function App() {
   };
 
   const holes = visited.map((h3) =>
-    cellToBoundary(h3, true).map(([lng, lat]) => ({ latitude: lat, longitude: lng }))
+    h3ToGeoBoundary(h3).map(([lat, lng]) => ({ latitude: lat, longitude: lng }))
   );
 
   if (!loc) {
