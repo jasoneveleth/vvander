@@ -41,7 +41,7 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
 // Pick H3 resolution based on map zoom (latitudeDelta) - even resolutions only
 const getDisplayRes = (latDelta: number): number => {
   if (latDelta < 0.025) return 10;   // Street level
-  if (latDelta < 0.09) return 8;    // Neighborhood
+  if (latDelta < 0.12) return 8;    // Neighborhood
   if (latDelta < 0.5) return 6;     // City
   if (latDelta < 5) return 4;       // Region
   return 2;                          // Very zoomed out
@@ -262,9 +262,6 @@ export default function App() {
           />
         ))}
       </MapView>
-      <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
-        <Text style={styles.locationIcon}>▲</Text>
-      </TouchableOpacity>
       {fogStatus && (
         <View style={styles.fogStatusBanner}>
           <Text style={styles.fogStatusText}>{fogStatus}</Text>
@@ -272,12 +269,17 @@ export default function App() {
       )}
       <View style={styles.controls}>
         <Text style={styles.stats}>{visited.length} hexes explored</Text>
-        <TouchableOpacity
-          style={[styles.button, tracking ? styles.stopButton : null]}
-          onPress={tracking ? stopTracking : startTracking}
-        >
-          <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'}</Text>
-        </TouchableOpacity>
+        <View style={styles.rightControls}>
+          <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
+            <Text style={styles.locationIcon}>▲</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.button, tracking ? styles.stopButton : null]}
+            onPress={tracking ? stopTracking : startTracking}
+          >
+            <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
     </View>
   );
@@ -302,10 +304,11 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   stopButton: { backgroundColor: '#d94a4a' },
+  rightControls: {
+    alignItems: 'center',
+    gap: 10,
+  },
   locationButton: {
-    position: 'absolute',
-    top: 60,
-    right: 20,
     backgroundColor: 'white',
     width: 44,
     height: 44,
@@ -326,7 +329,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 60,
     left: 20,
-    right: 80,
+    right: 20,
     backgroundColor: 'rgba(0,0,0,0.7)',
     paddingVertical: 8,
     paddingHorizontal: 12,
