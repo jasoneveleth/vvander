@@ -1,13 +1,13 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, AppState } from 'react-native';
-import MapView, { Polygon } from 'react-native-maps';
+import MapView, { Polygon, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import * as SQLite from 'expo-sqlite';
-import { geoToH3, h3ToGeoBoundary } from '@six33/h3-reactnative';
+import { geoToH3, h3ToParent, polyfill, h3SetToMultiPolygon } from '@six33/h3-reactnative';
 
 const TASK_NAME = 'VVANDER_LOCATION';
-const H3_RES = 9;
+const STORAGE_RES = 10; // Store at res 10 (~50m hexes)
 
 const db = SQLite.openDatabaseSync('vvander.db');
 db.execSync('CREATE TABLE IF NOT EXISTS visited (h3 TEXT PRIMARY KEY)');
@@ -23,23 +23,91 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
   if (error || !data) return;
   const { locations } = data as { locations: Location.LocationObject[] };
   for (const loc of locations) {
-    const h3 = geoToH3(loc.coords.latitude, loc.coords.longitude, H3_RES);
+    const h3 = geoToH3(loc.coords.latitude, loc.coords.longitude, STORAGE_RES);
     addVisited(h3);
   }
 });
 
-const FOG = [
-  { latitude: 85, longitude: -180 },
-  { latitude: 85, longitude: 180 },
-  { latitude: -85, longitude: 180 },
-  { latitude: -85, longitude: -180 },
-];
+// Pick H3 resolution based on map zoom (latitudeDelta) - even resolutions only
+const getDisplayRes = (latDelta: number): number => {
+  if (latDelta < 0.025) return 10;   // Street level
+  if (latDelta < 0.09) return 8;    // Neighborhood
+  if (latDelta < 0.5) return 6;     // City
+  if (latDelta < 5) return 4;       // Region
+  return 2;                          // Very zoomed out
+};
+
+// Padding in degrees to capture hexes at viewport edges (2x hex diameter)
+const HEX_PADDING: Record<number, number> = {
+  2: 10,      // ~1200km
+  4: 0.6,     // ~44km
+  6: 0.08,    // ~6km
+  8: 0.012,   // ~900m
+  10: 0.002,  // ~150m
+};
+
+// Get all hexes in a region at given resolution (with padding for edge hexes)
+const getHexesInRegion = (region: Region, res: number): string[] => {
+  const { latitude, longitude, latitudeDelta, longitudeDelta } = region;
+  const pad = HEX_PADDING[res] || 0.01;
+  const bounds = [
+    [latitude + latitudeDelta / 2 + pad, longitude - longitudeDelta / 2 - pad],
+    [latitude + latitudeDelta / 2 + pad, longitude + longitudeDelta / 2 + pad],
+    [latitude - latitudeDelta / 2 - pad, longitude + longitudeDelta / 2 + pad],
+    [latitude - latitudeDelta / 2 - pad, longitude - longitudeDelta / 2 - pad],
+  ];
+  return polyfill(bounds, res, false);
+};
+
+// Convert visited hexes to a Set at display resolution
+const getVisitedAtRes = (visited: string[], displayRes: number): Set<string> => {
+  const set = new Set<string>();
+  for (const h3 of visited) {
+    if (displayRes >= STORAGE_RES) {
+      set.add(h3);
+    } else {
+      set.add(h3ToParent(h3, displayRes));
+    }
+  }
+  return set;
+};
+
+const THROTTLE_MS = 100;
 
 export default function App() {
   const [visited, setVisited] = useState<string[]>(getVisited);
   const [loc, setLoc] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [region, setRegion] = useState<Region | null>(null);
   const [tracking, setTracking] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<string>('');
+
+  // Throttle region updates
+  const lastUpdateRef = useRef<number>(0);
+  const pendingRegionRef = useRef<Region | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const updateRegion = useCallback((newRegion: Region) => {
+    const now = Date.now();
+    const elapsed = now - lastUpdateRef.current;
+
+    if (elapsed >= THROTTLE_MS) {
+      lastUpdateRef.current = now;
+      setRegion(newRegion);
+    } else {
+      // Schedule update for remaining time
+      pendingRegionRef.current = newRegion;
+      if (!timeoutRef.current) {
+        timeoutRef.current = setTimeout(() => {
+          if (pendingRegionRef.current) {
+            lastUpdateRef.current = Date.now();
+            setRegion(pendingRegionRef.current);
+            pendingRegionRef.current = null;
+          }
+          timeoutRef.current = null;
+        }, THROTTLE_MS - elapsed);
+      }
+    }
+  }, []);
 
   const refreshVisited = useCallback(() => setVisited(getVisited()), []);
 
@@ -69,16 +137,18 @@ export default function App() {
       return;
     }
 
-    // Get initial location
     const initial = await Location.getCurrentPositionAsync({});
-    setLoc({ latitude: initial.coords.latitude, longitude: initial.coords.longitude });
-    const h3 = geoToH3(initial.coords.latitude, initial.coords.longitude, H3_RES);
+    const { latitude, longitude } = initial.coords;
+    setLoc({ latitude, longitude });
+    setRegion({ latitude, longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 });
+
+    const h3 = geoToH3(latitude, longitude, STORAGE_RES);
     addVisited(h3);
     refreshVisited();
 
     await Location.startLocationUpdatesAsync(TASK_NAME, {
       accuracy: Location.Accuracy.Balanced,
-      distanceInterval: 20,
+      distanceInterval: 10,
       deferredUpdatesInterval: 60000,
       showsBackgroundLocationIndicator: true,
       foregroundService: {
@@ -96,9 +166,30 @@ export default function App() {
     setTracking(false);
   };
 
-  const holes = visited.map((h3) =>
-    h3ToGeoBoundary(h3).map(([lat, lng]) => ({ latitude: lat, longitude: lng }))
-  );
+  // Calculate fog polygons for current viewport (merged boundaries only)
+  const fogPolygons = useMemo(() => {
+    if (!region) return [];
+
+    const displayRes = getDisplayRes(region.latitudeDelta);
+    const viewportHexes = getHexesInRegion(region, displayRes);
+    const visitedSet = getVisitedAtRes(visited, displayRes);
+
+    // Filter to only unvisited hexes (the fog)
+    const unvisited = viewportHexes.filter((h3) => !visitedSet.has(h3));
+
+    // Merge adjacent hexes into multipolygon (only outer boundaries)
+    const multiPolygon = h3SetToMultiPolygon(unvisited, false);
+
+    // Convert to react-native-maps format
+    // multiPolygon is number[][][][] - array of polygons, each with loops, each with [lat,lng] points
+    return multiPolygon.map((polygon, i) => ({
+      key: `fog-${i}-${displayRes}`,
+      coordinates: polygon[0].map(([lat, lng]) => ({ latitude: lat, longitude: lng })),
+      holes: polygon.slice(1).map((hole) =>
+        hole.map(([lat, lng]) => ({ latitude: lat, longitude: lng }))
+      ),
+    }));
+  }, [region, visited]);
 
   if (!loc) {
     return (
@@ -116,9 +207,19 @@ export default function App() {
       <MapView
         style={styles.container}
         initialRegion={{ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }}
+        onRegionChange={updateRegion}
         showsUserLocation
       >
-        <Polygon coordinates={FOG} holes={holes} fillColor="rgba(0,0,0,0.85)" strokeWidth={0} />
+        {fogPolygons.map(({ key, coordinates, holes }) => (
+          <Polygon
+            key={key}
+            coordinates={coordinates}
+            holes={holes}
+            fillColor="rgba(95,157,245,0.7)"
+            strokeColor="#5F9DF5"
+            strokeWidth={1}
+          />
+        ))}
       </MapView>
       <View style={styles.controls}>
         <Text style={styles.stats}>{visited.length} hexes explored</Text>
