@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, AppState } from 'react-native';
-import MapView, { Polygon, Region } from 'react-native-maps';
+import { StyleSheet, View, Text, TouchableOpacity, AppState, Platform } from 'react-native';
+import MapView, { Polygon, Polyline, Region } from 'react-native-maps';
+import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import * as SQLite from 'expo-sqlite';
@@ -27,6 +28,14 @@ const addVisited = (h3: string) =>
 const addLocation = (timestamp: number, latitude: number, longitude: number) =>
   db.runSync('INSERT INTO locations (timestamp, latitude, longitude) VALUES (?, ?, ?)', [timestamp, latitude, longitude]);
 
+type LocationPoint = { timestamp: number; latitude: number; longitude: number };
+
+const getLocationsByTimeRange = (startTime: number, endTime: number): LocationPoint[] =>
+  db.getAllSync<LocationPoint>(
+    'SELECT timestamp, latitude, longitude FROM locations WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC',
+    [startTime, endTime]
+  );
+
 // Background task - runs in separate JS context
 TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
   if (error || !data) return;
@@ -41,7 +50,7 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
 // Pick H3 resolution based on map zoom (latitudeDelta) - even resolutions only
 const getDisplayRes = (latDelta: number): number => {
   if (latDelta < 0.025) return 10;   // Street level
-  if (latDelta < 0.12) return 8;    // Neighborhood
+  if (latDelta < 0.24) return 8;    // Neighborhood
   if (latDelta < 0.5) return 6;     // City
   if (latDelta < 5) return 4;       // Region
   return 2;                          // Very zoomed out
@@ -90,6 +99,9 @@ export default function App() {
   const [region, setRegion] = useState<Region | null>(null);
   const [tracking, setTracking] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<string>('');
+
+  // Path overlay state - set time range to show path (null = no path)
+  const [pathTimeRange, setPathTimeRange] = useState<{ start: number; end: number } | null>(null);
 
   // Refs
   const mapRef = useRef<MapView>(null);
@@ -215,6 +227,78 @@ export default function App() {
     return { fogPolygons: polygons, fogStatus: null };
   }, [region, visited]);
 
+  // Compute path segments with opacity gradient
+  const pathSegments = useMemo(() => {
+    if (!pathTimeRange) return [];
+
+    const points = getLocationsByTimeRange(pathTimeRange.start, pathTimeRange.end);
+    if (points.length < 2) return [];
+
+    // Create segments with increasing opacity
+    const segments: { coordinates: { latitude: number; longitude: number }[]; opacity: number }[] = [];
+    const numSegments = Math.min(points.length - 1, 50); // Cap segments for performance
+    const step = Math.max(1, Math.floor((points.length - 1) / numSegments));
+
+    for (let i = 0; i < points.length - 1; i += step) {
+      const endIdx = Math.min(i + step, points.length - 1);
+      const progress = i / (points.length - 1); // 0 to 1
+      // Ease-in opacity: starts slow, accelerates
+      const opacity = Math.pow(progress, 0.5) * 0.9 + 0.1; // 0.1 to 1.0
+
+      const segmentCoords = [];
+      for (let j = i; j <= endIdx; j++) {
+        segmentCoords.push({ latitude: points[j].latitude, longitude: points[j].longitude });
+      }
+      segments.push({ coordinates: segmentCoords, opacity });
+    }
+
+    return segments;
+  }, [pathTimeRange]);
+
+  // Date picker state
+  const [showDatePicker, setShowDatePicker] = useState<'start' | 'end' | null>(null);
+
+  const togglePathOverlay = () => {
+    if (pathTimeRange) {
+      setPathTimeRange(null);
+    } else {
+      // Show last 24 hours by default
+      const now = Date.now();
+      setPathTimeRange({ start: now - 24 * 60 * 60 * 1000, end: now });
+    }
+  };
+
+  const handleDateChange = (event: DateTimePickerEvent, selectedDate?: Date) => {
+    if (Platform.OS === 'android') {
+      setShowDatePicker(null);
+    }
+    if (event.type === 'set' && selectedDate && pathTimeRange) {
+      const newTime = selectedDate.getTime();
+      if (showDatePicker === 'start') {
+        setPathTimeRange({ ...pathTimeRange, start: newTime });
+      } else if (showDatePicker === 'end') {
+        setPathTimeRange({ ...pathTimeRange, end: newTime });
+      }
+    }
+    if (Platform.OS === 'ios') {
+      // iOS picker stays open, dismiss on any interaction
+    }
+  };
+
+  const formatDate = (timestamp: number) => {
+    const d = new Date(timestamp);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  };
+
+  const formatDuration = (startMs: number, endMs: number) => {
+    const diffMs = endMs - startMs;
+    const hours = Math.floor(diffMs / (1000 * 60 * 60));
+    const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    if (hours > 0 && minutes > 0) return `${hours}h ${minutes}min`;
+    if (hours > 0) return `${hours}h`;
+    return `${minutes}min`;
+  };
+
   const centerOnLocation = async () => {
     const current = await Location.getCurrentPositionAsync({
       accuracy: Location.Accuracy.Low, // Fast response, good enough for centering
@@ -261,6 +345,14 @@ export default function App() {
             strokeWidth={1}
           />
         ))}
+        {pathSegments.map((segment, i) => (
+          <Polyline
+            key={`path-${i}`}
+            coordinates={segment.coordinates}
+            strokeColor={`rgba(255,0,0,${segment.opacity})`}
+            strokeWidth={4}
+          />
+        ))}
       </MapView>
       {fogStatus && (
         <View style={styles.fogStatusBanner}>
@@ -268,16 +360,42 @@ export default function App() {
         </View>
       )}
       <View style={styles.controls}>
-        <Text style={styles.stats}>{visited.length} hexes explored</Text>
+        <View style={styles.leftControls}>
+          {showDatePicker && pathTimeRange && (
+            <View style={styles.datePickerContainer}>
+              <DateTimePicker
+                value={new Date(showDatePicker === 'start' ? pathTimeRange.start : pathTimeRange.end)}
+                mode="datetime"
+                display={Platform.OS === 'ios' ? 'compact' : 'default'}
+                onChange={handleDateChange}
+                onTouchCancel={() => setShowDatePicker(null)}
+              />
+            </View>
+          )}
+          {pathTimeRange && (
+            <TouchableOpacity style={styles.dateButton} onPress={() => setShowDatePicker('start')}>
+              <Text style={styles.dateButtonText}>
+                {formatDate(pathTimeRange.start)} • {formatDuration(pathTimeRange.start, pathTimeRange.end)}
+              </Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            style={[styles.pathButton, pathTimeRange ? styles.pathButtonActive : null]}
+            onPress={togglePathOverlay}
+          >
+            <Text style={styles.pathButtonText}>{pathTimeRange ? 'Hide Path' : 'Show Path'}</Text>
+          </TouchableOpacity>
+          <Text style={styles.stats}>{visited.length} hexes explored</Text>
+        </View>
         <View style={styles.rightControls}>
           <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
             <Text style={styles.locationIcon}>▲</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.button, tracking ? styles.stopButton : null]}
+            style={tracking ? styles.pauseButton : styles.playButton}
             onPress={tracking ? stopTracking : startTracking}
           >
-            <Text style={styles.buttonText}>{tracking ? 'Stop' : 'Start'}</Text>
+            <Text style={tracking ? styles.pauseIcon : styles.playIcon}>{tracking ? '❚❚' : '▶'}</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -303,10 +421,77 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 8,
   },
-  stopButton: { backgroundColor: '#d94a4a' },
+  leftControls: {
+    alignItems: 'flex-start',
+    gap: 8,
+  },
   rightControls: {
     alignItems: 'center',
     gap: 10,
+  },
+  playButton: {
+    backgroundColor: '#4a90d9',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+  },
+  pauseButton: {
+    backgroundColor: 'white',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+  },
+  playIcon: {
+    fontSize: 16,
+    color: '#fff',
+  },
+  pauseIcon: {
+    fontSize: 14,
+    color: '#4a90d9',
+  },
+  pathButton: {
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 4,
+  },
+  pathButtonActive: {
+    backgroundColor: 'rgba(255,0,0,0.7)',
+  },
+  pathButtonText: {
+    color: '#fff',
+    fontSize: 12,
+  },
+  datePickerContainer: {
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderRadius: 8,
+    padding: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+  },
+  dateButton: {
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 4,
+  },
+  dateButtonText: {
+    color: '#fff',
+    fontSize: 11,
   },
   locationButton: {
     backgroundColor: 'white',
