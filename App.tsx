@@ -48,18 +48,18 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
 });
 
 // Pick H3 resolution based on map zoom (latitudeDelta)
-// Each H3 res step is ~2.6x larger, thresholds tuned for smaller hex appearance at cutover
+// Thresholds adjusted for 2x overscan - halved so hexes appear smaller at each cutover
 const getDisplayRes = (latDelta: number): number => {
   if (latDelta < 0.04) return 10;
-  if (latDelta < 0.08) return 9;
-  if (latDelta < 0.2) return 8;
-  if (latDelta < 0.5) return 7;
-  if (latDelta < 1.3) return 6;
-  if (latDelta < 3.4) return 5;
-  if (latDelta < 9) return 4;
-  if (latDelta < 23) return 3;
-  if (latDelta < 45) return 2;
-  if (latDelta < 60) return 1;
+  if (latDelta < 0.1) return 9;
+  if (latDelta < 0.3) return 8;
+  if (latDelta < 0.9) return 7;
+  if (latDelta < 2) return 6;
+  if (latDelta < 4) return 5;
+  if (latDelta < 10) return 4;
+  if (latDelta < 22) return 3;
+  if (latDelta < 50) return 2;
+  if (latDelta < 90) return 1;
   return 0;
 };
 
@@ -218,6 +218,71 @@ const getVisitedAtRes = (visited: string[], displayRes: number): Set<string> => 
   return set;
 };
 
+/**
+ * Build a ring that matches react-native-maps expectations:
+ * - array of {latitude, longitude}
+ * - first point repeated at end (closed ring)
+ * - remove degenerate consecutive duplicates
+ */
+function toClosedLatLngRing(coords: number[][]) {
+  const out: { latitude: number; longitude: number }[] = [];
+  let prevLat = NaN;
+  let prevLng = NaN;
+
+  for (let i = 0; i < coords.length; i++) {
+    const lat = coords[i][0];
+    const lng = coords[i][1];
+    if (lat === prevLat && lng === prevLng) continue;
+    out.push({ latitude: lat, longitude: lng });
+    prevLat = lat;
+    prevLng = lng;
+  }
+
+  // Close ring
+  if (out.length > 0) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (first.latitude !== last.latitude || first.longitude !== last.longitude) {
+      out.push({ ...first });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Convert a react-native-maps region into a rectangle ring.
+ * expandMultiplier makes the rectangle larger than the actual viewport
+ * to prevent seeing the fog edge when panning quickly.
+ */
+function regionToViewportRing(
+  region: {
+    latitude: number;
+    longitude: number;
+    latitudeDelta: number;
+    longitudeDelta: number;
+  },
+  expandMultiplier = 1
+) {
+  const latHalf = (region.latitudeDelta * expandMultiplier) / 2;
+  const lngHalf = (region.longitudeDelta * expandMultiplier) / 2;
+
+  const latMin = region.latitude - latHalf;
+  const latMax = region.latitude + latHalf;
+  const lngMin = region.longitude - lngHalf;
+  const lngMax = region.longitude + lngHalf;
+
+  const ring = [
+    { latitude: latMin, longitude: lngMin },
+    { latitude: latMin, longitude: lngMax },
+    { latitude: latMax, longitude: lngMax },
+    { latitude: latMax, longitude: lngMin },
+    { latitude: latMin, longitude: lngMin }, // close
+  ];
+
+  return ring;
+}
+
 const THROTTLE_MS = 100;
 
 export default function App() {
@@ -317,20 +382,22 @@ export default function App() {
     setTracking(false);
   };
 
-  // Calculate fog polygons for current viewport using grid cache
   const { fogPolygons, fogStatus, displayRes } = useMemo(() => {
     if (!region) return { fogPolygons: [], fogStatus: null, displayRes: null };
 
     const startTime = performance.now();
     const displayRes = getDisplayRes(region.latitudeDelta);
 
-    // Get hexes from grid cache (only computes missing cells)
+    // Hex calculation uses 4x expanded region to reduce cache misses when panning
+    const HEX_OVERSCAN = 4;
+
+    // Get hexes from grid cache with overscan
     const t1 = performance.now();
-    const { hexes: viewportHexes, cacheHits, cacheMisses } = getHexesFromGridCache(region, displayRes);
+    const { hexes: viewportHexes, cacheHits, cacheMisses } = getHexesFromGridCache(region, displayRes, HEX_OVERSCAN);
     const cacheTime = performance.now() - t1;
 
     // Cap hex count to prevent performance issues
-    if (viewportHexes.length > 2000) {
+    if (viewportHexes.length > 10_000) {
       return { fogPolygons: [], fogStatus: `Tiles hidden: too many hexes (${viewportHexes.length})`, displayRes };
     }
 
@@ -338,28 +405,79 @@ export default function App() {
     const visitedSet = getVisitedAtRes(visited, displayRes);
     const visitedTime = performance.now() - t2;
 
-    // Filter to only unvisited hexes (the fog)
-    const unvisited = viewportHexes.filter((h3: string) => !visitedSet.has(h3));
+    // Filter *visited* cells near viewport (usually smaller than unvisited)
+    const visitedNearViewport: string[] = [];
+    for (let i = 0; i < viewportHexes.length; i++) {
+      const h = viewportHexes[i];
+      if (visitedSet.has(h)) visitedNearViewport.push(h);
+    }
 
-    // Merge adjacent hexes into multipolygon (only outer boundaries)
+    // Fog polygon outer boundary - use HUGE fixed rectangle so edge is never visible
+    // Clockwise winding: SW -> NW -> NE -> SE -> SW
+    const fogOuterRing = [
+      { latitude: 20, longitude: -130 },  // SW
+      { latitude: 55, longitude: -130 },  // NW
+      { latitude: 55, longitude: -60 },   // NE
+      { latitude: 20, longitude: -60 },   // SE
+      { latitude: 20, longitude: -130 },  // close
+    ];
+
+    // If nothing visited, fog is just the large rectangle (no holes)
+    if (visitedNearViewport.length === 0) {
+      const totalTime = performance.now() - startTime;
+      if (totalTime > 20) {
+        console.warn(
+          `[FOG] ${totalTime.toFixed(0)}ms | res=${displayRes}, hexes=${viewportHexes.length}, cells=${cacheHits}hit/${cacheMisses}miss | ` +
+            `cache=${cacheTime.toFixed(0)}ms, visited=${visitedTime.toFixed(0)}ms, merge=0ms`
+        );
+      }
+      return {
+        fogPolygons: [
+          {
+            key: `fog-viewport-${displayRes}`,
+            coordinates: fogOuterRing,
+            holes: [],
+          },
+        ],
+        fogStatus: null,
+        displayRes,
+      };
+    }
+
+    // If fully explored in overscan area, no fog needed
+    if (visitedNearViewport.length === viewportHexes.length) {
+      return { fogPolygons: [], fogStatus: null, displayRes };
+    }
+
+    // Polygonize visited (cheaper + fewer pathologies than polygonizing unvisited)
     const t3 = performance.now();
-    const multiPolygon = h3SetToMultiPolygon(unvisited, false);
+    const visitedMulti = h3SetToMultiPolygon(visitedNearViewport, false);
     const multiPolyTime = performance.now() - t3;
 
-    // Convert to react-native-maps format
-    const polygons = multiPolygon.map((polygon, i) => ({
-      key: `fog-${i}-${displayRes}`,
-      coordinates: polygon[0].map(([lat, lng]) => ({ latitude: lat, longitude: lng })),
-      holes: polygon.slice(1).map((hole) =>
-        hole.map(([lat, lng]) => ({ latitude: lat, longitude: lng }))
-      ),
-    }));
+    // Convert visited outer rings into fog holes
+    // polygon[0] is outer ring; polygon.slice(1) are holes in visited (ignored for fog)
+    const holes: { latitude: number; longitude: number }[][] = [];
+    for (let p = 0; p < visitedMulti.length; p++) {
+      const poly = visitedMulti[p];
+      const outer = poly[0];
+      const ring = toClosedLatLngRing(outer);
+      if (ring.length >= 4) holes.push(ring);
+    }
+
+    // Fog polygon = large outer rectangle with visited areas as holes
+    const polygons = [
+      {
+        key: `fog-viewport-${displayRes}`,
+        coordinates: fogOuterRing,
+        holes,
+      },
+    ];
 
     const totalTime = performance.now() - startTime;
     if (totalTime > 20) {
       console.warn(
-        `[FOG] ${totalTime.toFixed(0)}ms | res=${displayRes}, hexes=${viewportHexes.length}, cells=${cacheHits}hit/${cacheMisses}miss | ` +
-        `cache=${cacheTime.toFixed(0)}ms, visited=${visitedTime.toFixed(0)}ms, merge=${multiPolyTime.toFixed(0)}ms`
+        `[FOG] ${totalTime.toFixed(0)}ms | res=${displayRes}, hexes=${viewportHexes.length}, visitedInView=${visitedNearViewport.length}, ` +
+          `cells=${cacheHits}hit/${cacheMisses}miss | cache=${cacheTime.toFixed(0)}ms, visited=${visitedTime.toFixed(0)}ms, merge=${multiPolyTime.toFixed(0)}ms`
       );
     }
 
@@ -392,8 +510,8 @@ export default function App() {
       let totalHits = 0;
       let totalMisses = 0;
 
-      // 2x expansion around current viewport
-      const { cacheHits: h1, cacheMisses: m1 } = getHexesFromGridCache(region, displayRes, 2);
+      // 6x expansion around current viewport to warm cache for panning
+      const { cacheHits: h1, cacheMisses: m1 } = getHexesFromGridCache(region, displayRes, 6);
       totalHits += h1;
       totalMisses += m1;
 
@@ -519,6 +637,7 @@ export default function App() {
         style={styles.container}
         initialRegion={{ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }}
         onRegionChange={updateRegion}
+        onRegionChangeComplete={updateRegion}
         showsUserLocation
         pitchEnabled={true}
         rotateEnabled={true}
@@ -593,7 +712,7 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: { flex: 1, backgroundColor: 'rgba(95,157,245,1)' },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e' },
   controls: {
     position: 'absolute',
