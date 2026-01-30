@@ -78,17 +78,113 @@ const HEX_PADDING: Record<number, number> = {
   10: 0.004,   // ~300m
 };
 
-// Get all hexes in a region at given resolution (with padding for edge hexes)
-const getHexesInRegion = (region: Region, res: number): string[] => {
+// Grid cell sizes per resolution (nice round fractions of degrees)
+// Tuned so each cell has ~40-60 hexes
+const GRID_CELL_SIZE: Record<number, number> = {
+  0: 30,
+  1: 10,
+  2: 5,
+  3: 2,
+  4: 1,
+  5: 0.5,
+  6: 0.2,
+  7: 0.1,
+  8: 0.05,
+  9: 0.02,
+  10: 0.01,
+};
+
+// Grid-based hex cache: "res:latCell:lngCell" -> hex[]
+const hexGridCache = new Map<string, string[]>();
+
+// Get grid cell key for a lat/lng at given resolution
+const getGridCellKey = (lat: number, lng: number, res: number): string => {
+  const cellSize = GRID_CELL_SIZE[res] || 0.1;
+  const latCell = Math.floor(lat / cellSize);
+  const lngCell = Math.floor(lng / cellSize);
+  return `${res}:${latCell}:${lngCell}`;
+};
+
+// Get bounds for a grid cell
+const getGridCellBounds = (latCell: number, lngCell: number, cellSize: number): number[][] => {
+  const minLat = latCell * cellSize;
+  const maxLat = (latCell + 1) * cellSize;
+  const minLng = lngCell * cellSize;
+  const maxLng = (lngCell + 1) * cellSize;
+  return [
+    [maxLat, minLng],
+    [maxLat, maxLng],
+    [minLat, maxLng],
+    [minLat, minLng],
+  ];
+};
+
+// Compute hexes for a single grid cell (calls polyfill)
+const computeGridCellHexes = (latCell: number, lngCell: number, res: number): string[] => {
+  const cellSize = GRID_CELL_SIZE[res] || 0.1;
+  const bounds = getGridCellBounds(latCell, lngCell, cellSize);
+  return polyfill(bounds, res, false);
+};
+
+// Get all grid cells overlapping a region (with padding)
+const getGridCellsForRegion = (region: Region, res: number, expansionMultiplier = 1): { latCell: number; lngCell: number }[] => {
   const { latitude, longitude, latitudeDelta, longitudeDelta } = region;
   const pad = HEX_PADDING[res] || 0.01;
-  const bounds = [
-    [latitude + latitudeDelta / 2 + pad, longitude - longitudeDelta / 2 - pad],
-    [latitude + latitudeDelta / 2 + pad, longitude + longitudeDelta / 2 + pad],
-    [latitude - latitudeDelta / 2 - pad, longitude + longitudeDelta / 2 + pad],
-    [latitude - latitudeDelta / 2 - pad, longitude - longitudeDelta / 2 - pad],
-  ];
-  return polyfill(bounds, res, false);
+  const cellSize = GRID_CELL_SIZE[res] || 0.1;
+
+  // Expand region by multiplier for prefetching
+  const expandedLatDelta = latitudeDelta * expansionMultiplier;
+  const expandedLngDelta = longitudeDelta * expansionMultiplier;
+
+  const minLat = latitude - expandedLatDelta / 2 - pad;
+  const maxLat = latitude + expandedLatDelta / 2 + pad;
+  const minLng = longitude - expandedLngDelta / 2 - pad;
+  const maxLng = longitude + expandedLngDelta / 2 + pad;
+
+  const minLatCell = Math.floor(minLat / cellSize);
+  const maxLatCell = Math.floor(maxLat / cellSize);
+  const minLngCell = Math.floor(minLng / cellSize);
+  const maxLngCell = Math.floor(maxLng / cellSize);
+
+  const cells: { latCell: number; lngCell: number }[] = [];
+  for (let lat = minLatCell; lat <= maxLatCell; lat++) {
+    for (let lng = minLngCell; lng <= maxLngCell; lng++) {
+      cells.push({ latCell: lat, lngCell: lng });
+    }
+  }
+  return cells;
+};
+
+// Get hexes for a region using grid cache
+// Returns { hexes, cacheHits, cacheMisses } for debugging
+const getHexesFromGridCache = (
+  region: Region,
+  res: number,
+  expansionMultiplier = 1
+): { hexes: string[]; cacheHits: number; cacheMisses: number } => {
+  const cells = getGridCellsForRegion(region, res, expansionMultiplier);
+  const allHexes = new Set<string>();
+  let cacheHits = 0;
+  let cacheMisses = 0;
+
+  for (const { latCell, lngCell } of cells) {
+    const key = `${res}:${latCell}:${lngCell}`;
+    let cellHexes = hexGridCache.get(key);
+
+    if (cellHexes) {
+      cacheHits++;
+    } else {
+      cacheMisses++;
+      cellHexes = computeGridCellHexes(latCell, lngCell, res);
+      hexGridCache.set(key, cellHexes);
+    }
+
+    for (const h3 of cellHexes) {
+      allHexes.add(h3);
+    }
+  }
+
+  return { hexes: Array.from(allHexes), cacheHits, cacheMisses };
 };
 
 // Convert visited hexes to a Set at display resolution
@@ -202,28 +298,36 @@ export default function App() {
     setTracking(false);
   };
 
-  // Calculate fog polygons for current viewport (merged boundaries only)
+  // Calculate fog polygons for current viewport using grid cache
   const { fogPolygons, fogStatus, displayRes } = useMemo(() => {
     if (!region) return { fogPolygons: [], fogStatus: null, displayRes: null };
 
+    const startTime = performance.now();
     const displayRes = getDisplayRes(region.latitudeDelta);
-    const viewportHexes = getHexesInRegion(region, displayRes);
+
+    // Get hexes from grid cache (only computes missing cells)
+    const t1 = performance.now();
+    const { hexes: viewportHexes, cacheHits, cacheMisses } = getHexesFromGridCache(region, displayRes);
+    const cacheTime = performance.now() - t1;
 
     // Cap hex count to prevent performance issues
     if (viewportHexes.length > 2000) {
       return { fogPolygons: [], fogStatus: `Tiles hidden: too many hexes (${viewportHexes.length})`, displayRes };
     }
 
+    const t2 = performance.now();
     const visitedSet = getVisitedAtRes(visited, displayRes);
+    const visitedTime = performance.now() - t2;
 
     // Filter to only unvisited hexes (the fog)
-    const unvisited = viewportHexes.filter((h3) => !visitedSet.has(h3));
+    const unvisited = viewportHexes.filter((h3: string) => !visitedSet.has(h3));
 
     // Merge adjacent hexes into multipolygon (only outer boundaries)
+    const t3 = performance.now();
     const multiPolygon = h3SetToMultiPolygon(unvisited, false);
+    const multiPolyTime = performance.now() - t3;
 
     // Convert to react-native-maps format
-    // multiPolygon is number[][][][] - array of polygons, each with loops, each with [lat,lng] points
     const polygons = multiPolygon.map((polygon, i) => ({
       key: `fog-${i}-${displayRes}`,
       coordinates: polygon[0].map(([lat, lng]) => ({ latitude: lat, longitude: lng })),
@@ -232,8 +336,34 @@ export default function App() {
       ),
     }));
 
+    const totalTime = performance.now() - startTime;
+    if (totalTime > 20) {
+      console.warn(
+        `[FOG] ${totalTime.toFixed(0)}ms | res=${displayRes}, hexes=${viewportHexes.length}, cells=${cacheHits}hit/${cacheMisses}miss | ` +
+        `cache=${cacheTime.toFixed(0)}ms, visited=${visitedTime.toFixed(0)}ms, merge=${multiPolyTime.toFixed(0)}ms`
+      );
+    }
+
     return { fogPolygons: polygons, fogStatus: null, displayRes };
   }, [region, visited]);
+
+  // Background expansion: prefetch 3x viewport after initial render
+  useEffect(() => {
+    if (!region) return;
+    const displayRes = getDisplayRes(region.latitudeDelta);
+
+    // Defer expansion until after paint
+    const timer = setTimeout(() => {
+      const t0 = performance.now();
+      const { cacheHits, cacheMisses } = getHexesFromGridCache(region, displayRes, 3);
+      const elapsed = performance.now() - t0;
+      if (cacheMisses > 0) {
+        console.log(`[FOG PREFETCH] ${elapsed.toFixed(0)}ms | res=${displayRes}, cells=${cacheHits}hit/${cacheMisses}miss (3x expansion)`);
+      }
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, [region]);
 
   // Compute path segments with opacity gradient
   const pathSegments = useMemo(() => {
