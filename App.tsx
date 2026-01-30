@@ -155,6 +155,24 @@ const getGridCellsForRegion = (region: Region, res: number, expansionMultiplier 
   return cells;
 };
 
+// Prefetch grid cells in a specific direction (offset from current region)
+// direction: { lat: -1/0/1, lng: -1/0/1 } indicates pan direction
+const prefetchInDirection = (
+  region: Region,
+  res: number,
+  direction: { lat: number; lng: number }
+): { cacheHits: number; cacheMisses: number } => {
+  // Create an offset region in the direction of movement
+  const offsetRegion: Region = {
+    latitude: region.latitude + direction.lat * region.latitudeDelta,
+    longitude: region.longitude + direction.lng * region.longitudeDelta,
+    latitudeDelta: region.latitudeDelta * 2,
+    longitudeDelta: region.longitudeDelta * 2,
+  };
+  const { cacheHits, cacheMisses } = getHexesFromGridCache(offsetRegion, res);
+  return { cacheHits, cacheMisses };
+};
+
 // Get hexes for a region using grid cache
 // Returns { hexes, cacheHits, cacheMisses } for debugging
 const getHexesFromGridCache = (
@@ -217,6 +235,7 @@ export default function App() {
   const lastUpdateRef = useRef<number>(0);
   const pendingRegionRef = useRef<Region | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const prevRegionRef = useRef<Region | null>(null);
 
   const updateRegion = useCallback((newRegion: Region) => {
     const now = Date.now();
@@ -347,20 +366,52 @@ export default function App() {
     return { fogPolygons: polygons, fogStatus: null, displayRes };
   }, [region, visited]);
 
-  // Background expansion: prefetch 3x viewport after initial render
+  // Background prefetch: 2x around viewport + directional prefetch based on pan
   useEffect(() => {
     if (!region) return;
     const displayRes = getDisplayRes(region.latitudeDelta);
+    const prevRegion = prevRegionRef.current;
 
-    // Defer expansion until after paint
+    // Detect pan direction
+    let direction = { lat: 0, lng: 0 };
+    if (prevRegion) {
+      const latDelta = region.latitude - prevRegion.latitude;
+      const lngDelta = region.longitude - prevRegion.longitude;
+      // Normalize to -1, 0, or 1 (with threshold to ignore tiny movements)
+      const threshold = region.latitudeDelta * 0.1;
+      if (Math.abs(latDelta) > threshold) direction.lat = latDelta > 0 ? 1 : -1;
+      if (Math.abs(lngDelta) > threshold) direction.lng = lngDelta > 0 ? 1 : -1;
+    }
+
+    // Update prev region
+    prevRegionRef.current = region;
+
+    // Defer prefetch until after paint
     const timer = setTimeout(() => {
       const t0 = performance.now();
-      const { cacheHits, cacheMisses } = getHexesFromGridCache(region, displayRes, 3);
-      const elapsed = performance.now() - t0;
-      if (cacheMisses > 0) {
-        console.log(`[FOG PREFETCH] ${elapsed.toFixed(0)}ms | res=${displayRes}, cells=${cacheHits}hit/${cacheMisses}miss (3x expansion)`);
+      let totalHits = 0;
+      let totalMisses = 0;
+
+      // 2x expansion around current viewport
+      const { cacheHits: h1, cacheMisses: m1 } = getHexesFromGridCache(region, displayRes, 2);
+      totalHits += h1;
+      totalMisses += m1;
+
+      // Directional prefetch if panning
+      if (direction.lat !== 0 || direction.lng !== 0) {
+        const { cacheHits: h2, cacheMisses: m2 } = prefetchInDirection(region, displayRes, direction);
+        totalHits += h2;
+        totalMisses += m2;
       }
-    }, 100);
+
+      const elapsed = performance.now() - t0;
+      if (totalMisses > 0) {
+        const dirStr = direction.lat !== 0 || direction.lng !== 0
+          ? ` dir=(${direction.lat},${direction.lng})`
+          : '';
+        console.log(`[PREFETCH] ${elapsed.toFixed(0)}ms | res=${displayRes}, cells=${totalHits}hit/${totalMisses}miss${dirStr}`);
+      }
+    }, 50);
 
     return () => clearTimeout(timer);
   }, [region]);
