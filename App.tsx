@@ -47,22 +47,35 @@ TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
   }
 });
 
-// Pick H3 resolution based on map zoom (latitudeDelta) - even resolutions only
+// Pick H3 resolution based on map zoom (latitudeDelta)
+// Each H3 res step is ~2.6x larger, thresholds tuned for smaller hex appearance at cutover
 const getDisplayRes = (latDelta: number): number => {
-  if (latDelta < 0.025) return 10;   // Street level
-  if (latDelta < 0.24) return 8;    // Neighborhood
-  if (latDelta < 0.5) return 6;     // City
-  if (latDelta < 5) return 4;       // Region
-  return 2;                          // Very zoomed out
+  if (latDelta < 0.04) return 10;
+  if (latDelta < 0.08) return 9;
+  if (latDelta < 0.2) return 8;
+  if (latDelta < 0.5) return 7;
+  if (latDelta < 1.3) return 6;
+  if (latDelta < 3.4) return 5;
+  if (latDelta < 9) return 4;
+  if (latDelta < 23) return 3;
+  if (latDelta < 45) return 2;
+  if (latDelta < 60) return 1;
+  return 0;
 };
 
-// Padding in degrees to capture hexes at viewport edges (2x hex diameter)
+// Padding in degrees to capture hexes at viewport edges
 const HEX_PADDING: Record<number, number> = {
-  2: 10,      // ~1200km
-  4: 0.6,     // ~44km
-  6: 0.08,    // ~6km
-  8: 0.012,   // ~900m
-  10: 0.002,  // ~150m
+  0: 50,       // ~4000km
+  1: 20,       // ~1500km
+  2: 8,        // ~600km
+  3: 3,        // ~230km
+  4: 1.2,      // ~90km
+  5: 0.45,     // ~35km
+  6: 0.17,     // ~13km
+  7: 0.065,    // ~5km
+  8: 0.025,    // ~2km
+  9: 0.01,     // ~750m
+  10: 0.004,   // ~300m
 };
 
 // Get all hexes in a region at given resolution (with padding for edge hexes)
@@ -190,20 +203,15 @@ export default function App() {
   };
 
   // Calculate fog polygons for current viewport (merged boundaries only)
-  const { fogPolygons, fogStatus } = useMemo(() => {
-    if (!region) return { fogPolygons: [], fogStatus: null };
-
-    // Don't render fog when zoomed out too far (performance + antimeridian issues)
-    if (region.latitudeDelta > 20) {
-      return { fogPolygons: [], fogStatus: 'Tiles hidden: please zoom in' };
-    }
+  const { fogPolygons, fogStatus, displayRes } = useMemo(() => {
+    if (!region) return { fogPolygons: [], fogStatus: null, displayRes: null };
 
     const displayRes = getDisplayRes(region.latitudeDelta);
     const viewportHexes = getHexesInRegion(region, displayRes);
 
     // Cap hex count to prevent performance issues
     if (viewportHexes.length > 2000) {
-      return { fogPolygons: [], fogStatus: `Tiles hidden: too many hexes (${viewportHexes.length})` };
+      return { fogPolygons: [], fogStatus: `Tiles hidden: too many hexes (${viewportHexes.length})`, displayRes };
     }
 
     const visitedSet = getVisitedAtRes(visited, displayRes);
@@ -224,7 +232,7 @@ export default function App() {
       ),
     }));
 
-    return { fogPolygons: polygons, fogStatus: null };
+    return { fogPolygons: polygons, fogStatus: null, displayRes };
   }, [region, visited]);
 
   // Compute path segments with opacity gradient
@@ -385,7 +393,7 @@ export default function App() {
           >
             <Text style={styles.pathButtonText}>{pathTimeRange ? 'Hide Path' : 'Show Path'}</Text>
           </TouchableOpacity>
-          <Text style={styles.stats}>{visited.length} hexes explored</Text>
+          <Text style={styles.stats}>{visited.length} hexes explored{displayRes !== null ? ` • res ${displayRes}` : ''}</Text>
         </View>
         <View style={styles.rightControls}>
           <TouchableOpacity style={styles.locationButton} onPress={centerOnLocation}>
