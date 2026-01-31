@@ -5,7 +5,8 @@
       "Bash(npm uninstall:*)",
       "Bash(npm install:*)",
       "Bash(npm search:*)",
-      "Bash(npx expo install:*)"
+      "Bash(npx expo install:*)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }

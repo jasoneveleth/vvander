@@ -1,2 +1,0 @@
-npx expo run:ios --configuration Release --device
-npx expo run:ios --device
