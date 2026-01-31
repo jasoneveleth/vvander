@@ -312,7 +312,7 @@ export default function App() {
     if (visitedNearViewport.length === 0) {
       logPerf(performance.now() - startTime, displayRes, viewportHexes.length, 0, cacheHits, cacheMisses, cacheTime, visitedTime, 0);
       return {
-        fogPolygons: [{ key: `fog-viewport-${displayRes}`, coordinates: fogOuterRing, holes: [] }],
+        fogPolygons: [{ key: `fog-${displayRes}-0`, coordinates: fogOuterRing, holes: [] }],
         fogStatus: null,
         displayRes,
       };
@@ -333,7 +333,7 @@ export default function App() {
     logPerf(performance.now() - startTime, displayRes, viewportHexes.length, visitedNearViewport.length, cacheHits, cacheMisses, cacheTime, visitedTime, multiPolyTime);
 
     return {
-      fogPolygons: [{ key: `fog-viewport-${displayRes}`, coordinates: fogOuterRing, holes }],
+      fogPolygons: [{ key: `fog-${displayRes}-${holes.length}`, coordinates: fogOuterRing, holes }],
       fogStatus: null,
       displayRes,
     };
