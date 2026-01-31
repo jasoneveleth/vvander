@@ -478,7 +478,7 @@ export default function App() {
         onRegionChange={updateRegion}
         onRegionChangeComplete={updateRegion}
         showsUserLocation
-        pitchEnabled={true}
+        pitchEnabled={false}
         rotateEnabled={true}
         mapType={region && region.latitudeDelta > 5 ? 'hybridFlyover' : 'standard'}
       >
