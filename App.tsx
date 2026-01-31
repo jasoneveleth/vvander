@@ -302,17 +302,33 @@ export default function App() {
 
     const visitedNearViewport = viewportHexes.filter(h => visitedSet.has(h));
 
-    // Fixed fog boundary (covers typical US usage)
-    const fogOuterRing = [
-      { latitude: 20, longitude: -130 }, { latitude: 55, longitude: -130 },
-      { latitude: 55, longitude: -60 }, { latitude: 20, longitude: -60 },
-      { latitude: 20, longitude: -130 },
+    // At low res (global view), create fog for both hemispheres to avoid antimeridian issues
+    const fogOuterRings = displayRes <= 1 ? [
+      // Western hemisphere
+      [
+        { latitude: -85, longitude: -179.9 }, { latitude: 85, longitude: -179.9 },
+        { latitude: 85, longitude: 0 }, { latitude: -85, longitude: 0 },
+        { latitude: -85, longitude: -179.9 },
+      ],
+      // Eastern hemisphere
+      [
+        { latitude: -85, longitude: 0 }, { latitude: 85, longitude: 0 },
+        { latitude: 85, longitude: 179.9 }, { latitude: -85, longitude: 179.9 },
+        { latitude: -85, longitude: 0 },
+      ],
+    ] : [
+      // Regional view (US-focused)
+      [
+        { latitude: 20, longitude: -130 }, { latitude: 55, longitude: -130 },
+        { latitude: 55, longitude: -60 }, { latitude: 20, longitude: -60 },
+        { latitude: 20, longitude: -130 },
+      ],
     ];
 
     if (visitedNearViewport.length === 0) {
       logPerf(performance.now() - startTime, displayRes, viewportHexes.length, 0, cacheHits, cacheMisses, cacheTime, visitedTime, 0);
       return {
-        fogPolygons: [{ key: `fog-${displayRes}-0`, coordinates: fogOuterRing, holes: [] }],
+        fogPolygons: fogOuterRings.map((coords, i) => ({ key: `fog-${displayRes}-0-${i}`, coordinates: coords, holes: [] })),
         fogStatus: null,
         displayRes,
       };
@@ -326,14 +342,30 @@ export default function App() {
     const visitedMulti = h3SetToMultiPolygon(visitedNearViewport, false);
     const multiPolyTime = performance.now() - t3;
 
-    const holes = visitedMulti
+    const allHoles = visitedMulti
       .map(poly => toClosedLatLngRing(poly[0]))
       .filter(ring => ring.length >= 4);
 
     logPerf(performance.now() - startTime, displayRes, viewportHexes.length, visitedNearViewport.length, cacheHits, cacheMisses, cacheTime, visitedTime, multiPolyTime);
 
+    // For global view (2 hemispheres), filter holes by longitude to match each polygon
+    const getHolesForPolygon = (polygonIndex: number) => {
+      if (displayRes > 1) return allHoles; // Single polygon uses all holes
+
+      // Western hemisphere (index 0): holes with lng < 0
+      // Eastern hemisphere (index 1): holes with lng >= 0
+      return allHoles.filter(hole => {
+        const avgLng = hole.reduce((sum, pt) => sum + pt.longitude, 0) / hole.length;
+        return polygonIndex === 0 ? avgLng < 0 : avgLng >= 0;
+      });
+    };
+
     return {
-      fogPolygons: [{ key: `fog-${displayRes}-${holes.length}`, coordinates: fogOuterRing, holes }],
+      fogPolygons: fogOuterRings.map((coords, i) => ({
+        key: `fog-${displayRes}-${allHoles.length}-${i}`,
+        coordinates: coords,
+        holes: getHolesForPolygon(i),
+      })),
       fogStatus: null,
       displayRes,
     };
